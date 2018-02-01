@@ -232,6 +232,13 @@ robj *createZsetZiplistObject(void) {
     return o;
 }
 
+robj *createStreamObject(void) {
+    stream *s = streamNew();
+    robj *o = createObject(OBJ_STREAM,s);
+    o->encoding = OBJ_ENCODING_STREAM;
+    return o;
+}
+
 robj *createModuleObject(moduleType *mt, void *value) {
     moduleValue *mv = zmalloc(sizeof(*mv));
     mv->type = mt;
@@ -246,11 +253,9 @@ void freeStringObject(robj *o) {
 }
 
 void freeListObject(robj *o) {
-    switch (o->encoding) {
-    case OBJ_ENCODING_QUICKLIST:
+    if (o->encoding == OBJ_ENCODING_QUICKLIST) {
         quicklistRelease(o->ptr);
-        break;
-    default:
+    } else {
         serverPanic("Unknown list encoding type");
     }
 }
@@ -305,6 +310,10 @@ void freeModuleObject(robj *o) {
     zfree(mv);
 }
 
+void freeStreamObject(robj *o) {
+    freeStream(o->ptr);
+}
+
 void incrRefCount(robj *o) {
     if (o->refcount != OBJ_SHARED_REFCOUNT) o->refcount++;
 }
@@ -318,6 +327,7 @@ void decrRefCount(robj *o) {
         case OBJ_ZSET: freeZsetObject(o); break;
         case OBJ_HASH: freeHashObject(o); break;
         case OBJ_MODULE: freeModuleObject(o); break;
+        case OBJ_STREAM: freeStreamObject(o); break;
         default: serverPanic("Unknown object type"); break;
         }
         zfree(o);
@@ -560,11 +570,11 @@ int getDoubleFromObject(const robj *o, double *target) {
         if (sdsEncodedObject(o)) {
             errno = 0;
             value = strtod(o->ptr, &eptr);
-            if (isspace(((const char*)o->ptr)[0]) ||
-                eptr[0] != '\0' ||
+            if (sdslen(o->ptr) == 0 ||
+                isspace(((const char*)o->ptr)[0]) ||
+                (size_t)(eptr-(char*)o->ptr) != sdslen(o->ptr) ||
                 (errno == ERANGE &&
                     (value == HUGE_VAL || value == -HUGE_VAL || value == 0)) ||
-                errno == EINVAL ||
                 isnan(value))
                 return C_ERR;
         } else if (o->encoding == OBJ_ENCODING_INT) {
@@ -602,8 +612,12 @@ int getLongDoubleFromObject(robj *o, long double *target) {
         if (sdsEncodedObject(o)) {
             errno = 0;
             value = strtold(o->ptr, &eptr);
-            if (isspace(((char*)o->ptr)[0]) || eptr[0] != '\0' ||
-                errno == ERANGE || isnan(value))
+            if (sdslen(o->ptr) == 0 ||
+                isspace(((const char*)o->ptr)[0]) ||
+                (size_t)(eptr-(char*)o->ptr) != sdslen(o->ptr) ||
+                (errno == ERANGE &&
+                    (value == HUGE_VAL || value == -HUGE_VAL || value == 0)) ||
+                isnan(value))
                 return C_ERR;
         } else if (o->encoding == OBJ_ENCODING_INT) {
             value = (long)o->ptr;
@@ -725,7 +739,7 @@ size_t objectComputeSize(robj *o, size_t sample_size) {
                 elesize += sizeof(quicklistNode)+ziplistBlobLen(node->zl);
                 samples++;
             } while ((node = node->next) && samples < sample_size);
-            asize += (double)elesize/samples*listTypeLength(o);
+            asize += (double)elesize/samples*ql->len;
         } else if (o->encoding == OBJ_ENCODING_ZIPLIST) {
             asize = sizeof(*o)+ziplistBlobLen(o->ptr);
         } else {
@@ -786,6 +800,57 @@ size_t objectComputeSize(robj *o, size_t sample_size) {
         } else {
             serverPanic("Unknown hash encoding");
         }
+    } else if (o->type == OBJ_STREAM) {
+        stream *s = o->ptr;
+        /* Note: to guess the size of the radix tree is not trivial, so we
+         * approximate it considering 64 bytes of data overhead for each
+         * key (the ID), and then adding the number of bare nodes, plus some
+         * overhead due by the data and child pointers. This secret recipe
+         * was obtained by checking the average radix tree created by real
+         * workloads, and then adjusting the constants to get numbers that
+         * more or less match the real memory usage.
+         *
+         * Actually the number of nodes and keys may be different depending
+         * on the insertion speed and thus the ability of the radix tree
+         * to compress prefixes. */
+        asize = sizeof(*o);
+        asize += s->rax->numele * 64;
+        asize += s->rax->numnodes * sizeof(raxNode);
+        asize += s->rax->numnodes * 32*7; /* Add a few child pointers... */
+
+        /* Now we have to add the listpacks. The last listpack is often non
+         * complete, so we estimate the size of the first N listpacks, and
+         * use the average to compute the size of the first N-1 listpacks, and
+         * finally add the real size of the last node. */
+        raxIterator ri;
+        raxStart(&ri,s->rax);
+        raxSeek(&ri,"^",NULL,0);
+        size_t lpsize = 0, samples = 0;
+        while(samples < sample_size && raxNext(&ri)) {
+            unsigned char *lp = ri.data;
+            lpsize += lpBytes(lp);
+            samples++;
+        }
+        if (s->rax->numele <= samples) {
+            asize += lpsize;
+        } else {
+            if (samples) lpsize /= samples; /* Compute the average. */
+            asize += lpsize * (s->rax->numele-1);
+            /* No need to check if seek succeeded, we enter this branch only
+             * if there are a few elements in the radix tree. */
+            raxSeek(&ri,"$",NULL,0);
+            raxNext(&ri);
+            asize += lpBytes(ri.data);
+        }
+        raxStop(&ri);
+    } else if (o->type == OBJ_MODULE) {
+        moduleValue *mv = o->ptr;
+        moduleType *mt = mv->type;
+        if (mt->mem_usage != NULL) {
+            asize = mt->mem_usage(mv->value);
+        } else {
+            asize = 0;
+        }
     } else {
         serverPanic("Unknown object type");
     }
@@ -828,9 +893,9 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
 
         listRewind(server.slaves,&li);
         while((ln = listNext(&li))) {
-            client *client = listNodeValue(ln);
-            mem += getClientOutputBufferMemoryUsage(client);
-            mem += sdsAllocSize(client->querybuf);
+            client *c = listNodeValue(ln);
+            mem += getClientOutputBufferMemoryUsage(c);
+            mem += sdsAllocSize(c->querybuf);
             mem += sizeof(client);
         }
     }
@@ -844,11 +909,11 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
 
         listRewind(server.clients,&li);
         while((ln = listNext(&li))) {
-            client *client = listNodeValue(ln);
-            if (client->flags & CLIENT_SLAVE)
+            client *c = listNodeValue(ln);
+            if (c->flags & CLIENT_SLAVE)
                 continue;
-            mem += getClientOutputBufferMemoryUsage(client);
-            mem += sdsAllocSize(client->querybuf);
+            mem += getClientOutputBufferMemoryUsage(c);
+            mem += sdsAllocSize(c->querybuf);
             mem += sizeof(client);
         }
     }
@@ -945,7 +1010,7 @@ sds getMemoryDoctorReport(void) {
         }
 
         /* Slaves using more than 10 MB each? */
-        if (mh->clients_slaves / numslaves > (1024*1024*10)) {
+        if (numslaves > 0 && mh->clients_slaves / numslaves > (1024*1024*10)) {
             big_slave_buf = 1;
             num_reports++;
         }
@@ -955,14 +1020,14 @@ sds getMemoryDoctorReport(void) {
     if (num_reports == 0) {
         s = sdsnew(
         "Hi Sam, I can't find any memory issue in your instance. "
-        "I can only account for what occurs on this base.");
+        "I can only account for what occurs on this base.\n");
     } else if (empty == 1) {
         s = sdsnew(
         "Hi Sam, this instance is empty or is using very little memory, "
         "my issues detector can't be used in these conditions. "
         "Please, leave for your mission on Earth and fill it with some data. "
         "The new Sam and I will be back to our programming as soon as I "
-        "finished rebooting.");
+        "finished rebooting.\n");
     } else {
         s = sdsnew("Sam, I detected a few issues in this Redis instance memory implants:\n\n");
         if (big_peak) {
@@ -1002,11 +1067,20 @@ robj *objectCommandLookupOrReply(client *c, robj *key, robj *reply) {
 }
 
 /* Object command allows to inspect the internals of an Redis Object.
- * Usage: OBJECT <refcount|encoding|idletime> <key> */
+ * Usage: OBJECT <refcount|encoding|idletime|freq> <key> */
 void objectCommand(client *c) {
     robj *o;
 
-    if (!strcasecmp(c->argv[1]->ptr,"refcount") && c->argc == 3) {
+    if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
+        const char *help[] = {
+"encoding <key> -- Return the kind of internal representation used in order to store the value associated with a key.",
+"freq <key> -- Return the access frequency index of the key. The returned integer is proportional to the logarithm of the recent access frequency of the key.",
+"idletime <key> -- Return the idle time of the key, that is the approximated number of seconds elapsed since the last access to the key.",
+"refcount <key> -- Return the number of references of the value associated with the specified key.",
+NULL
+        };
+        addReplyHelp(c, help);
+    } else if (!strcasecmp(c->argv[1]->ptr,"refcount") && c->argc == 3) {
         if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
                 == NULL) return;
         addReplyLongLong(c,o->refcount);
@@ -1025,13 +1099,17 @@ void objectCommand(client *c) {
     } else if (!strcasecmp(c->argv[1]->ptr,"freq") && c->argc == 3) {
         if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
                 == NULL) return;
-        if (server.maxmemory_policy & MAXMEMORY_FLAG_LRU) {
-            addReplyError(c,"An LRU maxmemory policy is selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.");
+        if (!(server.maxmemory_policy & MAXMEMORY_FLAG_LFU)) {
+            addReplyError(c,"An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.");
             return;
         }
-        addReplyLongLong(c,o->lru&255);
+        /* LFUDecrAndReturn should be called
+         * in case of the key has not been accessed for a long time,
+         * because we update the access time only
+         * when the key is read or overwritten. */
+        addReplyLongLong(c,LFUDecrAndReturn(o));
     } else {
-        addReplyError(c,"Syntax error. Try OBJECT (refcount|encoding|idletime|freq)");
+        addReplyErrorFormat(c, "Unknown subcommand or wrong number of arguments for '%s'. Try OBJECT help", (char *)c->argv[1]->ptr);
     }
 }
 
@@ -1064,7 +1142,7 @@ void memoryCommand(client *c) {
         if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
                 == NULL) return;
         size_t usage = objectComputeSize(o,samples);
-        usage += sdsAllocSize(c->argv[1]->ptr);
+        usage += sdsAllocSize(c->argv[2]->ptr);
         usage += sizeof(dictEntry);
         addReplyLongLong(c,usage);
     } else if (!strcasecmp(c->argv[1]->ptr,"stats") && c->argc == 2) {
@@ -1157,7 +1235,9 @@ void memoryCommand(client *c) {
         /* Nothing to do for other allocators. */
 #endif
     } else if (!strcasecmp(c->argv[1]->ptr,"help") && c->argc == 2) {
-        addReplyMultiBulkLen(c,4);
+        addReplyMultiBulkLen(c,5);
+        addReplyBulkCString(c,
+"MEMORY DOCTOR                        - Outputs memory problems report");
         addReplyBulkCString(c,
 "MEMORY USAGE <key> [SAMPLES <count>] - Estimate memory usage of key");
         addReplyBulkCString(c,
